@@ -1,0 +1,9 @@
+# Datos locales del usuario: nunca se suben
+config.json
+gadget.log*
+lib/
+venv/
+.venv/
+__pycache__/
+*.pyc
+*.bak*

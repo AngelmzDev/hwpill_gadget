@@ -1,0 +1,4 @@
+psutil
+nvidia-ml-py
+# Opcional, solo para potencia y reloj de CPU (necesita Python 3.13 o anterior):
+pythonnet
