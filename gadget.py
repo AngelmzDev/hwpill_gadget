@@ -1,4 +1,4 @@
-# hwpill_gadget — mini-panel flotante con uso de CPU/GPU/RAM, temperatura y VRAM de GPU + métricas opcionales
+# hwpill_gadget — mini-panel flotante con FPS, uso de CPU/GPU/RAM, temperatura y VRAM de GPU + métricas opcionales
 # Requiere: psutil (obligatorio); nvidia-ml-py (GPU NVIDIA) y pythonnet + lib\*.dll (potencia y reloj de CPU), ambos opcionales.
 # La potencia y el reloj de CPU solo funcionan con administrador y con las DLL de LibreHardwareMonitor (ver sensores.py).
 
@@ -243,6 +243,108 @@ class GpuReader:
             self.handle = None
 
 
+PRESENTMON_DIR = os.path.join(BASE, "presentmon")
+PM_SESSION = "hwpill_gadget_fps"
+
+
+def foreground_pid():
+    pid = ctypes.c_ulong()
+    user32 = ctypes.windll.user32
+    user32.GetWindowThreadProcessId(user32.GetForegroundWindow(), ctypes.byref(pid))
+    return pid.value
+
+
+class FpsReader:
+    """FPS de la ventana activa vía PresentMon (ETW, necesita admin). Se queda con el último proceso
+    activo que pintaba frames: así, hacer clic en el gadget (por ejemplo en otra pantalla) no pierde el juego.
+    PresentMon solo se lanza la primera vez que se piden FPS."""
+
+    def __init__(self):
+        self.proc = None
+        self.frames = {}        # pid -> [suma de ms entre presents, nº de frames] desde la última lectura
+        self.lock = threading.Lock()
+        self.game_pid = None
+        self.last_fps = None
+        self.last_seen = 0.0
+        self._next_try = 0.0
+
+    def _start(self):
+        exe = sensores.presentmon_ruta(PRESENTMON_DIR)
+        if not is_admin() or not os.path.exists(exe):
+            return
+        try:
+            self.proc = subprocess.Popen(
+                [exe, "--output_stdout", "--no_console_stats", "--session_name", PM_SESSION,
+                 "--stop_existing_session", "--no_track_display", "--no_track_gpu", "--no_track_input",
+                 "--exclude", "dwm.exe"],
+                stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True, creationflags=CREATE_NO_WINDOW,
+            )
+            threading.Thread(target=self._reader, args=(self.proc,), daemon=True).start()
+        except Exception:
+            self.proc = None
+            log.exception("No se pudo arrancar PresentMon")
+
+    def _reader(self, proc):
+        cols = None
+        try:
+            for line in proc.stdout:
+                parts = line.rstrip("\n").split(",")
+                if "ProcessID" in parts and "MsBetweenPresents" in parts:
+                    cols = parts.index("ProcessID"), parts.index("MsBetweenPresents")
+                    continue
+                if not cols:
+                    continue
+                try:
+                    pid, ms = int(parts[cols[0]]), float(parts[cols[1]])
+                except (ValueError, IndexError):
+                    continue
+                if ms <= 0:
+                    continue
+                with self.lock:
+                    acc = self.frames.setdefault(pid, [0.0, 0])
+                    acc[0] += ms
+                    acc[1] += 1
+        except Exception:
+            log.exception("Error leyendo la salida de PresentMon")
+
+    def read(self):
+        """FPS del juego activo, o None si no hay juego o no hay medidor."""
+        now = time.monotonic()
+        if self.proc is None or self.proc.poll() is not None:
+            self.proc = None
+            if now < self._next_try:
+                return None
+            self._next_try = now + 10  # reintenta cada 10 s (p. ej. justo después de instalarlo)
+            self._start()
+            if self.proc is None:
+                return None
+        with self.lock:
+            frames, self.frames = self.frames, {}
+        fg = foreground_pid()
+        if fg in frames and fg != os.getpid() and fg != self.game_pid:
+            self.game_pid = fg
+        if self.game_pid in frames:
+            total_ms, n = frames[self.game_pid]
+            self.last_fps, self.last_seen = 1000 * n / total_ms, now
+        elif now - self.last_seen > 2:  # la salida de PresentMon llega a ráfagas: aguanta el valor 2 s
+            if self.game_pid is not None and not psutil.pid_exists(self.game_pid):
+                self.game_pid = None
+            self.last_fps = 0 if self.game_pid is not None else None
+        return self.last_fps
+
+    def close(self):
+        if self.proc:
+            self.proc.terminate()
+            self.proc = None
+            # La sesión ETW sobrevive al proceso: se cierra aparte
+            try:
+                subprocess.run([sensores.presentmon_ruta(PRESENTMON_DIR), "--terminate_existing_session",
+                                "--session_name", PM_SESSION], stdout=subprocess.DEVNULL,
+                               stderr=subprocess.DEVNULL, timeout=5, creationflags=CREATE_NO_WINDOW)
+            except Exception:
+                log.warning("No se pudo cerrar la sesión de PresentMon", exc_info=True)
+
+
 class Sensors:
     """Lee todo en un hilo aparte para no congelar la UI. close() lo detiene y libera los drivers."""
 
@@ -253,8 +355,11 @@ class Sensors:
         self.ram_pct = None
         self.ram_used_gb = self.ram_total_gb = 0.0
         self.net_down = self.net_up = self.disk_rate = None
+        self.fps = None
+        self.want_fps = False  # lo activa la UI si la métrica FPS está visible
         self._lhm = LhmReader()
         self._gpu = GpuReader()
+        self._fps = FpsReader()
         self._stop = threading.Event()
         self._closed = False
         self._thread = threading.Thread(target=self._loop, daemon=True)
@@ -294,12 +399,15 @@ class Sensors:
                         self.disk_rate = ((disk1.read_bytes + disk1.write_bytes)
                                           - (disk0.read_bytes + disk0.write_bytes)) / dt
                     net0, disk0, t0 = net1, disk1, t1
+                    # shortcut: al ocultar FPS, PresentMon sigue vivo hasta cerrar el gadget
+                    self.fps = self._fps.read() if self.want_fps else None
                 except Exception:
                     log.exception("Error en el ciclo de lectura de sensores")
         finally:
             # Liberar drivers desde el propio hilo evita cerrar a mitad de una lectura
             self._lhm.close()
             self._gpu.close()
+            self._fps.close()
 
     def close(self):
         if self._closed:
@@ -320,6 +428,7 @@ FG_BRIGHT = "#c8c8c8"   # botón del menú al pasar el ratón
 
 # clave → (etiqueta del panel, ancho en caracteres de cada valor, texto del menú)
 METRICS = {
+    "fps":  ("FPS",  (4,),   "FPS (juego activo)"),
     "cpu":  ("CPU",  (4,),   "CPU (uso)"),
     "gpu":  ("GPU",  (4, 4), "GPU (uso y temp)"),
     "ram":  ("RAM",  (4,),   "RAM"),
@@ -330,7 +439,7 @@ METRICS = {
     "net":  ("NET",  (6, 6), "Red (↓ ↑)"),
     "dsk":  ("DSK",  (6,),   "Disco (lect+escr)"),
 }
-ORDER = ["cpu", "gpu", "ram", "vram", "cpuw", "gpuw", "clk", "net", "dsk"]
+ORDER = ["fps", "cpu","gpu", "ram", "vram", "cpuw", "gpuw", "clk", "net", "dsk"]
 ALPHAS = (100, 88, 75, 60, 40)
 
 
@@ -373,6 +482,7 @@ class Gadget:
             self.alpha = DEFAULT_ALPHA
 
         self.sensors = Sensors()
+        self.sensors.want_fps = "fps" in self.enabled
         atexit.register(self.sensors.close)
         self.root = tk.Tk()
         self.root.overrideredirect(True)
@@ -510,6 +620,8 @@ class Gadget:
         menu.add_command(label="Reiniciar posición", command=self._reset_pos)
         if not sensores.instaladas(os.path.join(BASE, "lib")):
             menu.add_command(label="Instalar sensores de CPU (potencia y reloj)…", command=self._instalar_sensores)
+        if not os.path.exists(sensores.presentmon_ruta(PRESENTMON_DIR)):
+            menu.add_command(label="Instalar medidor de FPS (PresentMon)…", command=self._instalar_fps)
         menu.add_separator()
         menu.add_command(label="Cerrar", command=self._quit)
         return menu
@@ -534,8 +646,11 @@ class Gadget:
             self._vars_metric[key].set(True)
             return
         self.enabled = wanted
+        self.sensors.want_fps = "fps" in wanted
         save_config(metrics=wanted)
         self._build()
+        if key == "fps" and "fps" in wanted and not os.path.exists(sensores.presentmon_ruta(PRESENTMON_DIR)):
+            self._instalar_fps()
 
     def _set_alpha(self, pct):
         self.alpha = pct / 100
@@ -562,6 +677,19 @@ class Gadget:
             ok, msg = sensores.instalar(os.path.join(BASE, "lib"))
             texto = msg + ("\n\nCierra y vuelve a abrir el gadget." if ok else "")
             self.root.after(0, lambda: messagebox.showinfo("Sensores de CPU", texto, parent=self.root))
+        threading.Thread(target=trabajo, daemon=True).start()
+
+    def _instalar_fps(self):
+        """Descarga con permiso PresentMon (MIT) del release oficial de Intel, verificado por hash. Opcional."""
+        from tkinter import messagebox
+        if not messagebox.askyesno("Medidor de FPS", sensores.AVISO_FPS, parent=self.root):
+            return
+
+        def trabajo():
+            ok, msg = sensores.instalar_presentmon(PRESENTMON_DIR)
+            if ok and not is_admin():
+                msg += "\n\nPara medir FPS, ejecuta el gadget como administrador."
+            self.root.after(0, lambda: messagebox.showinfo("Medidor de FPS", msg, parent=self.root))
         threading.Thread(target=trabajo, daemon=True).start()
 
     def _fijar(self):
@@ -615,6 +743,7 @@ class Gadget:
         s = self.sensors
         W = None  # sin color propio: usa FG_OK
         return {
+            "fps": [(fmt(s.fps, ""), color_gradient(s.fps, 60, 30))],  # invertido: 60+ verde, ≤30 rojo
             "cpu": [(fmt(s.cpu_pct, "%"), color_gradient(s.cpu_pct, 40, 100))],
             "gpu": [(fmt(s.gpu_pct, "%"), color_gradient(s.gpu_pct, 40, 100)),
                     (fmt(s.gpu_temp, "°"), color_gradient(s.gpu_temp, 40, 85))],

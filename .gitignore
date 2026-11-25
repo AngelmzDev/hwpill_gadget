@@ -2,6 +2,7 @@
 config.json
 gadget.log*
 lib/
+presentmon/
 venv/
 .venv/
 __pycache__/

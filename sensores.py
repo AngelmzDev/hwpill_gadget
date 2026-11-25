@@ -1,4 +1,4 @@
-"""Instalación opcional de los sensores de CPU (potencia y reloj) con LibreHardwareMonitor.
+"""Instalación opcional de los sensores de CPU (potencia y reloj) con LibreHardwareMonitor y del medidor de FPS (PresentMon).
 
 No se distribuyen binarios en este repositorio. Con permiso del usuario se descargan de NuGet (nuget.org) dos paquetes con la versión
 fijada y se comprueba el SHA-256 del paquete y de cada DLL antes de copiarla a lib\\. Si algo no coincide, no se instala nada.
@@ -38,6 +38,38 @@ AVISO = (
     "Se comprueba su huella SHA-256 antes de instalarlas. El gadget se ejecuta como administrador, "
     "así que solo acepta si te fías de estas fuentes. Puedes decir que no: el resto del gadget funciona igual."
 )
+
+
+# ─── Medidor de FPS (opcional): PresentMon de Intel, MIT ─────────────────────
+# Ejecutable firmado por Intel Corporation. Se descarga del release oficial y se comprueba su SHA-256.
+PRESENTMON_URL = "https://github.com/GameTechDev/PresentMon/releases/download/v2.6.0/PresentMon-2.6.0-x64.exe"
+PRESENTMON_SHA256 = "b2a706bc6ad475749e3b7e3409263aa1e6906d45bdcf993f6dbc0f660188f1af"
+
+AVISO_FPS = (
+    "Para medir los FPS el gadget necesita PresentMon, la herramienta de código abierto (MIT) de Intel.\n\n"
+    "¿Descargar ahora PresentMon 2.6.0 desde su página oficial de GitHub (GameTechDev/PresentMon)?\n"
+    "Se comprueba su huella SHA-256 antes de guardarlo. Necesita ejecutar el gadget como administrador. "
+    "Puedes decir que no: el resto del gadget funciona igual."
+)
+
+
+def presentmon_ruta(carpeta: str) -> str:
+    return os.path.join(carpeta, "PresentMon.exe")
+
+
+def instalar_presentmon(carpeta: str) -> tuple[bool, str]:
+    """Descarga PresentMon y solo lo guarda si su SHA-256 coincide. Devuelve (ok, mensaje)."""
+    try:
+        req = urllib.request.Request(PRESENTMON_URL, headers={"User-Agent": "hwpill_gadget"})
+        datos = urllib.request.urlopen(req, timeout=60).read()
+        if hashlib.sha256(datos).hexdigest() != PRESENTMON_SHA256:
+            return False, "La descarga no coincide con la huella esperada. No se ha instalado nada."
+        os.makedirs(carpeta, exist_ok=True)
+        with open(presentmon_ruta(carpeta), "wb") as f:
+            f.write(datos)
+        return True, "Medidor de FPS instalado."
+    except Exception as e:
+        return False, f"No se pudo descargar ({type(e).__name__}). Inténtalo más tarde desde el menú."
 
 
 def instaladas(lib: str) -> bool:
